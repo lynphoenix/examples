@@ -1,0 +1,6 @@
+dcgan/data
+data
+*.pyc
+OpenNMT/data
+.ipynb_checkpoints
+

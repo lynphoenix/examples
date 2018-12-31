@@ -5,6 +5,7 @@ import shutil
 import time
 import warnings
 
+from tensorboardX import SummaryWriter
 import torch
 import torch.nn as nn
 import torch.nn.parallel
@@ -16,6 +17,7 @@ import torch.utils.data.distributed
 import torchvision.transforms as transforms
 import torchvision.datasets as datasets
 import torchvision.models as models
+import nvidia_smi
 
 model_names = sorted(name for name in models.__dict__
     if name.islower() and not name.startswith("__")
@@ -64,9 +66,39 @@ parser.add_argument('--gpu', default=None, type=int,
 
 best_prec1 = 0
 
+_IMAGENET_PCA = {
+    'eigval': torch.Tensor([0.2175, 0.0188, 0.0045]),
+    'eigvec': torch.Tensor([
+        [-0.5675,  0.7192,  0.4009],
+        [-0.5808, -0.0045, -0.8140],
+        [-0.5836, -0.6948,  0.4203],
+    ])
+}
+
+
+class Lighting(object):
+    """Lighting noise(AlexNet - style PCA - based noise)"""
+
+    def __init__(self, alphastd, eigval, eigvec):
+        self.alphastd = alphastd
+        self.eigval = eigval
+        self.eigvec = eigvec
+
+    def __call__(self, img):
+        if self.alphastd == 0:
+            return img
+
+        alpha = img.new().resize_(3).normal_(0, self.alphastd)
+        rgb = self.eigvec.type_as(img).clone()\
+            .mul(alpha.view(1, 3).expand(3, 3))\
+            .mul(self.eigval.view(1, 3).expand(3, 3))\
+            .sum(1).squeeze()
+
+        return img.add(rgb.view(3, 1, 1).expand_as(img))
+
 
 def main():
-    global args, best_prec1
+    global args, best_prec1, _IMAGENET_PCA
     args = parser.parse_args()
 
     if args.seed is not None:
@@ -114,7 +146,9 @@ def main():
 
     optimizer = torch.optim.SGD(model.parameters(), args.lr,
                                 momentum=args.momentum,
-                                weight_decay=args.weight_decay)
+                                weight_decay=args.weight_decay,
+                                nesterov=True)
+    # sheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer,milestones=[30,60,90],gamma=0.1)
 
     # optionally resume from a checkpoint
     if args.resume:
@@ -132,6 +166,8 @@ def main():
 
     cudnn.benchmark = True
 
+    writer = SummaryWriter('/workspace/mnt/group/ava1/linyining/code/pytorch_projects/tensorboard/imagenet')
+
     # Data loading code
     traindir = os.path.join(args.data, 'train')
     valdir = os.path.join(args.data, 'val')
@@ -143,7 +179,9 @@ def main():
         transforms.Compose([
             transforms.RandomResizedCrop(224),
             transforms.RandomHorizontalFlip(),
+            transforms.ColorJitter(brightness=0.4, contrast=0, saturation=0.4, hue=0.4),
             transforms.ToTensor(),
+            Lighting(0.1, _IMAGENET_PCA['eigval'], _IMAGENET_PCA['eigvec']),
             normalize,
         ]))
 
@@ -170,13 +208,15 @@ def main():
         validate(val_loader, model, criterion)
         return
 
+    nvidia_smi.nvmlInit()
     for epoch in range(args.start_epoch, args.epochs):
         if args.distributed:
             train_sampler.set_epoch(epoch)
-        adjust_learning_rate(optimizer, epoch)
+        lr = adjust_learning_rate(optimizer, epoch)
+        writer.add_scalar('data/lr', lr, epoch)
 
         # train for one epoch
-        train(train_loader, model, criterion, optimizer, epoch)
+        train(train_loader, model, criterion, optimizer, epoch, writer)
 
         # evaluate on validation set
         prec1 = validate(val_loader, model, criterion)
@@ -192,8 +232,11 @@ def main():
             'optimizer' : optimizer.state_dict(),
         }, is_best)
 
+    writer.export_scalars_to_json("./all_scalars.json")
+    writer.close()
 
-def train(train_loader, model, criterion, optimizer, epoch):
+
+def train(train_loader, model, criterion, optimizer, epoch, writer):
     batch_time = AverageMeter()
     data_time = AverageMeter()
     losses = AverageMeter()
@@ -203,6 +246,7 @@ def train(train_loader, model, criterion, optimizer, epoch):
     # switch to train mode
     model.train()
 
+    deviceCount = nvidia_smi.nvmlDeviceGetCount()
     end = time.time()
     for i, (input, target) in enumerate(train_loader):
         # measure data loading time
@@ -240,6 +284,23 @@ def train(train_loader, model, criterion, optimizer, epoch):
                   'Prec@5 {top5.val:.3f} ({top5.avg:.3f})'.format(
                    epoch, i, len(train_loader), batch_time=batch_time,
                    data_time=data_time, loss=losses, top1=top1, top5=top5))
+            writer.add_scalar('data/batch_time.val', batch_time.val, i)
+            writer.add_scalar('data/batch_time.avg', batch_time.avg, i)
+            writer.add_scalar('data/data_time.val', data_time.val, i)
+            writer.add_scalar('data/data_time.avg', data_time.avg, i)
+            writer.add_scalar('data/loss.val', losses.val, i)
+            writer.add_scalar('data/loss.avg', losses.avg, i)
+            writer.add_scalar('data/top1.val', top1.val, i)
+            writer.add_scalar('data/top1.avg', top1.avg, i)
+            writer.add_scalar('data/top5.val', top5.val, i)
+            writer.add_scalar('data/top5.avg', top5.avg, i)
+            writer.add_scalar('data/top5.avg', top5.avg, i)
+        for dc in range(deviceCount):
+            handle = nvidia_smi.nvmlDeviceGetHandleByIndex(dc)
+            res = nvidia_smi.nvmlDeviceGetUtilizationRates(handle)
+            writer.add_scalar('nv/gpu-%d'%dc, res.gpu, i)
+            res = nvidia_smi.nvmlDeviceGetMemoryInfo(handle)
+            writer.add_scalar('nv/gpu_mem-%d'%dc, res.used, i)
 
 
 def validate(val_loader, model, criterion):
@@ -316,6 +377,7 @@ def adjust_learning_rate(optimizer, epoch):
     lr = args.lr * (0.1 ** (epoch // 30))
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
+    return lr
 
 
 def accuracy(output, target, topk=(1,)):
