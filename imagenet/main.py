@@ -224,7 +224,7 @@ def main_worker(gpu, ngpus_per_node, args):
 
     cudnn.benchmark = True
 
-    writer = SummaryWriter('/workspace/mnt/group/ava1/linyining/code/pytorch_projects/tensorboard/imagenet')
+    writer = SummaryWriter('/workspace/mnt/group/test/linyining/tensorboard/imagenet-train')
 
     # Data loading code
     traindir = os.path.join(args.data, 'train')
@@ -266,11 +266,13 @@ def main_worker(gpu, ngpus_per_node, args):
         validate(val_loader, model, criterion, args)
         return
 
+    args.train_size = len(train_loader)
+    args.val_size = len(val_loader)
     nvidia_smi.nvmlInit()
     for epoch in range(args.start_epoch, args.epochs):
         if args.distributed:
             train_sampler.set_epoch(epoch)
-        lr = adjust_learning_rate(optimizer, epoch)
+        lr = adjust_learning_rate(optimizer, epoch, args)
         writer.add_scalar('data/lr', lr, epoch)
 
         # train for one epoch
@@ -304,6 +306,7 @@ def train(train_loader, model, criterion, optimizer, epoch, writer, args):
     top1 = AverageMeter()
     top5 = AverageMeter()
 
+    cur_idx = args.train_size * epoch
     # switch to train mode
     model.train()
 
@@ -345,23 +348,23 @@ def train(train_loader, model, criterion, optimizer, epoch, writer, args):
                   'Acc@5 {top5.val:.3f} ({top5.avg:.3f})'.format(
                    epoch, i, len(train_loader), batch_time=batch_time,
                    data_time=data_time, loss=losses, top1=top1, top5=top5))
-            writer.add_scalar('data/batch_time.val', batch_time.val, i)
-            writer.add_scalar('data/batch_time.avg', batch_time.avg, i)
-            writer.add_scalar('data/data_time.val', data_time.val, i)
-            writer.add_scalar('data/data_time.avg', data_time.avg, i)
-            writer.add_scalar('data/loss.val', losses.val, i)
-            writer.add_scalar('data/loss.avg', losses.avg, i)
-            writer.add_scalar('data/top1.val', top1.val, i)
-            writer.add_scalar('data/top1.avg', top1.avg, i)
-            writer.add_scalar('data/top5.val', top5.val, i)
-            writer.add_scalar('data/top5.avg', top5.avg, i)
-            writer.add_scalar('data/top5.avg', top5.avg, i)
+        writer.add_scalar('data/batch_time.val', batch_time.val, i+cur_idx)
+        # writer.add_scalar('data/batch_time.avg', batch_time.avg, i+cur_idx)
+        writer.add_scalar('data/data_time.val', data_time.val, i+cur_idx)
+        # writer.add_scalar('data/data_time.avg', data_time.avg, i+cur_idx)
+        writer.add_scalar('data/loss.val', losses.val, i+cur_idx)
+        writer.add_scalar('data/loss.avg', losses.avg, i+cur_idx)
+        writer.add_scalar('data/top1.val', top1.val, i+cur_idx)
+        writer.add_scalar('data/top1.avg', top1.avg, i+cur_idx)
+        writer.add_scalar('data/top5.val', top5.val, i+cur_idx)
+        writer.add_scalar('data/top5.avg', top5.avg, i+cur_idx)
+        writer.add_scalar('data/top5.avg', top5.avg, i+cur_idx)
         for dc in range(deviceCount):
             handle = nvidia_smi.nvmlDeviceGetHandleByIndex(dc)
             res = nvidia_smi.nvmlDeviceGetUtilizationRates(handle)
-            writer.add_scalar('nv/gpu-%d'%dc, res.gpu, i)
+            writer.add_scalar('nv/gpu-%d'%dc, res.gpu, i+cur_idx)
             res = nvidia_smi.nvmlDeviceGetMemoryInfo(handle)
-            writer.add_scalar('nv/gpu_mem-%d'%dc, res.used, i)
+            writer.add_scalar('nv/gpu_mem-%d'%dc, res.used, i+cur_idx)
 
 
 def validate(val_loader, model, criterion, args):
@@ -431,6 +434,18 @@ class AverageMeter(object):
         self.sum += val * n
         self.count += n
         self.avg = self.sum / self.count
+
+
+def warmup_learning_rate(optimizer, epoch, iter, args):
+    lr_init_adjust = args.lr * args.batch_size / 256    # large init lr
+    cur_iter = epoch * args.train_size + iter
+    if epoch < args.warmup:
+        lr = cur_iter * lr_init_adjust / (args.warmup * args.train_size)
+    else:
+        lr = lr_init_adjust * (0.1 ** ((epoch - args.warmup) // 30))
+    for param_group in optimizer.param_groups:
+        param_group['lr'] = lr
+    return lr
 
 
 def adjust_learning_rate(optimizer, epoch, args):
