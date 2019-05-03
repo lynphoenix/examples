@@ -3,4 +3,6 @@ data
 *.pyc
 OpenNMT/data
 .ipynb_checkpoints
-
+*.tar
+res*txt
+*json

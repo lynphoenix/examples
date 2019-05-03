@@ -19,7 +19,9 @@ import torch.utils.data.distributed
 import torchvision.transforms as transforms
 import torchvision.datasets as datasets
 import torchvision.models as models
-import nvidia_smi
+from py3nvml.py3nvml import *
+from optim import *
+
 
 model_names = sorted(name for name in models.__dict__
     if name.islower() and not name.startswith("__")
@@ -76,6 +78,14 @@ parser.add_argument('--multiprocessing-distributed', action='store_true',
                          'N processes per node, which has N GPUs. This is the '
                          'fastest way to use PyTorch for either single node or '
                          'multi node data parallel training')
+parser.add_argument('--opt', default='sgd', type=str,
+                    help='optimizier')
+parser.add_argument('--sch', default='step', type=str,
+                    help='lr scheduler')
+parser.add_argument('--warmup-epochs', default=5, type=int,
+                    help='warm up epochs.')
+parser.add_argument('--log-file', default='train.log', type=str,
+                    help='val log')
 
 best_acc1 = 0
 
@@ -149,6 +159,7 @@ def main():
 def main_worker(gpu, ngpus_per_node, args):
     global best_acc1
     args.gpu = gpu
+    batch_size = args.batch_size
 
     if args.gpu is not None:
         print("Use GPU: {} for training".format(args.gpu))
@@ -202,11 +213,15 @@ def main_worker(gpu, ngpus_per_node, args):
     # define loss function (criterion) and optimizer
     criterion = nn.CrossEntropyLoss().cuda(args.gpu)
 
-    optimizer = torch.optim.SGD(model.parameters(), args.lr,
-                                momentum=args.momentum,
-                                weight_decay=args.weight_decay,
-                                nesterov=True)
-    # sheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer,milestones=[30,60,90],gamma=0.1)
+    if args.sch == 'warm':
+        args.lr = linear_scaleup_lr(args.lr, 256, batch_size)
+        print('learning rate: %f, batchsize = %d' %(args.lr, batch_size))
+    if args.opt == 'sgd':
+        print('SGD')
+        optimizer = torch.optim.SGD(model.parameters(), args.lr,
+                                    momentum=args.momentum,
+                                    weight_decay=args.weight_decay,
+                                    nesterov=True)
 
     # optionally resume from a checkpoint
     if args.resume:
@@ -224,7 +239,7 @@ def main_worker(gpu, ngpus_per_node, args):
 
     cudnn.benchmark = True
 
-    writer = SummaryWriter('/workspace/mnt/group/test/linyining/tensorboard/imagenet-train')
+    writer = SummaryWriter('/workspace/mnt/group/ava1/linyining/code/pytorch_projects/tensorboard/imagenet')
 
     # Data loading code
     traindir = os.path.join(args.data, 'train')
@@ -266,19 +281,25 @@ def main_worker(gpu, ngpus_per_node, args):
         validate(val_loader, model, criterion, args)
         return
 
-    args.train_size = len(train_loader)
-    args.val_size = len(val_loader)
-    nvidia_smi.nvmlInit()
+    nvmlInit()
     for epoch in range(args.start_epoch, args.epochs):
         if args.distributed:
             train_sampler.set_epoch(epoch)
-        lr = adjust_learning_rate(optimizer, epoch, args)
-        writer.add_scalar('data/lr', lr, epoch)
+        if args.sch == 'warm':
+            if epoch >= args.warmup_epochs:
+                lr = cosine_lr(optimizer, epoch, args.epochs, args.lr)
+                args.cur_lr = lr
+                writer.add_scalar('data/lr', lr, epoch)
+        else:
+            lr = adjust_learning_rate(optimizer, epoch, args)
+            args.cur_lr = lr
+            writer.add_scalar('data/lr', lr, epoch)
 
         # train for one epoch
         train(train_loader, model, criterion, optimizer, epoch, writer, args)
 
         # evaluate on validation set
+        args.cur_epoch = epoch
         acc1 = validate(val_loader, model, criterion, args)
 
         # remember best acc@1 and save checkpoint
@@ -306,16 +327,24 @@ def train(train_loader, model, criterion, optimizer, epoch, writer, args):
     top1 = AverageMeter()
     top5 = AverageMeter()
 
-    cur_idx = args.train_size * epoch
     # switch to train mode
     model.train()
 
-    deviceCount = nvidia_smi.nvmlDeviceGetCount()
+    deviceCount = nvmlDeviceGetCount()
     end = time.time()
+    iters = len(train_loader)
+    
+    warmup_iters = args.warmup_epochs * iters
     for i, (input, target) in enumerate(train_loader):
         # measure data loading time
         data_time.update(time.time() - end)
-
+        if args.sch == 'warm':
+            if epoch < args.warmup_epochs:
+                lr = warmup_learning_rate(optimizer, args.lr, epoch, i, iters, warmup_iters)
+            else:
+                lr = args.cur_lr
+        else:
+            lr = args.cur_lr
         if args.gpu is not None:
             input = input.cuda(args.gpu, non_blocking=True)
         target = target.cuda(args.gpu, non_blocking=True)
@@ -343,28 +372,29 @@ def train(train_loader, model, criterion, optimizer, epoch, writer, args):
             print('Epoch: [{0}][{1}/{2}]\t'
                   'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
                   'Data {data_time.val:.3f} ({data_time.avg:.3f})\t'
-                  'Loss {loss.val:.4f} ({loss.avg:.4f})\t'
+                  'Loss {loss.val:.3f} ({loss.avg:.3f})\t'
                   'Acc@1 {top1.val:.3f} ({top1.avg:.3f})\t'
-                  'Acc@5 {top5.val:.3f} ({top5.avg:.3f})'.format(
+                  'Acc@5 {top5.val:.3f} ({top5.avg:.3f}) \t '
+                  'LR {lr:.3f}'.format(
                    epoch, i, len(train_loader), batch_time=batch_time,
-                   data_time=data_time, loss=losses, top1=top1, top5=top5))
-        writer.add_scalar('data/batch_time.val', batch_time.val, i+cur_idx)
-        # writer.add_scalar('data/batch_time.avg', batch_time.avg, i+cur_idx)
-        writer.add_scalar('data/data_time.val', data_time.val, i+cur_idx)
-        # writer.add_scalar('data/data_time.avg', data_time.avg, i+cur_idx)
-        writer.add_scalar('data/loss.val', losses.val, i+cur_idx)
-        writer.add_scalar('data/loss.avg', losses.avg, i+cur_idx)
-        writer.add_scalar('data/top1.val', top1.val, i+cur_idx)
-        writer.add_scalar('data/top1.avg', top1.avg, i+cur_idx)
-        writer.add_scalar('data/top5.val', top5.val, i+cur_idx)
-        writer.add_scalar('data/top5.avg', top5.avg, i+cur_idx)
-        writer.add_scalar('data/top5.avg', top5.avg, i+cur_idx)
+                   data_time=data_time, loss=losses, top1=top1, top5=top5, lr=lr))
+            writer.add_scalar('data/batch_time.val', batch_time.val, i)
+            writer.add_scalar('data/batch_time.avg', batch_time.avg, i)
+            writer.add_scalar('data/data_time.val', data_time.val, i)
+            writer.add_scalar('data/data_time.avg', data_time.avg, i)
+            writer.add_scalar('data/loss.val', losses.val, i)
+            writer.add_scalar('data/loss.avg', losses.avg, i)
+            writer.add_scalar('data/top1.val', top1.val, i)
+            writer.add_scalar('data/top1.avg', top1.avg, i)
+            writer.add_scalar('data/top5.val', top5.val, i)
+            writer.add_scalar('data/top5.avg', top5.avg, i)
+            writer.add_scalar('data/top5.avg', top5.avg, i)
         for dc in range(deviceCount):
-            handle = nvidia_smi.nvmlDeviceGetHandleByIndex(dc)
-            res = nvidia_smi.nvmlDeviceGetUtilizationRates(handle)
-            writer.add_scalar('nv/gpu-%d'%dc, res.gpu, i+cur_idx)
-            res = nvidia_smi.nvmlDeviceGetMemoryInfo(handle)
-            writer.add_scalar('nv/gpu_mem-%d'%dc, res.used, i+cur_idx)
+            handle = nvmlDeviceGetHandleByIndex(dc)
+            res = nvmlDeviceGetUtilizationRates(handle)
+            writer.add_scalar('nv/gpu-%d'%dc, res.gpu, i)
+            res = nvmlDeviceGetMemoryInfo(handle)
+            writer.add_scalar('nv/gpu_mem-%d'%dc, res.used, i)
 
 
 def validate(val_loader, model, criterion, args):
@@ -377,6 +407,7 @@ def validate(val_loader, model, criterion, args):
     model.eval()
 
     with torch.no_grad():
+        t1 = time.time()
         end = time.time()
         for i, (input, target) in enumerate(val_loader):
             if args.gpu is not None:
@@ -405,10 +436,14 @@ def validate(val_loader, model, criterion, args):
                       'Acc@5 {top5.val:.3f} ({top5.avg:.3f})'.format(
                        i, len(val_loader), batch_time=batch_time, loss=losses,
                        top1=top1, top5=top5))
+        t2 = time.time()
 
         print(' * Acc@1 {top1.avg:.3f} Acc@5 {top5.avg:.3f}'
-              .format(top1=top1, top5=top5))
-
+                .format(top1=top1, top5=top5))
+        fp = open(args.log_file, 'a')
+        fp.write('Test: [{0}] * Acc@1 {top1.avg:.3f} Acc@5 {top5.avg:.3f}, Test time: {dt:.3f}\n' .format(
+            args.cur_epoch, top1=top1, top5=top5, dt=t2-t1))
+        fp.close()
     return top1.avg
 
 
@@ -434,18 +469,6 @@ class AverageMeter(object):
         self.sum += val * n
         self.count += n
         self.avg = self.sum / self.count
-
-
-def warmup_learning_rate(optimizer, epoch, iter, args):
-    lr_init_adjust = args.lr * args.batch_size / 256    # large init lr
-    cur_iter = epoch * args.train_size + iter
-    if epoch < args.warmup:
-        lr = cur_iter * lr_init_adjust / (args.warmup * args.train_size)
-    else:
-        lr = lr_init_adjust * (0.1 ** ((epoch - args.warmup) // 30))
-    for param_group in optimizer.param_groups:
-        param_group['lr'] = lr
-    return lr
 
 
 def adjust_learning_rate(optimizer, epoch, args):
